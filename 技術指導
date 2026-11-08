@@ -1,0 +1,142 @@
+# 一、 信息提取与审计
+# 作用：提取组件的物理路径、版本信息及标志位
+dumpsys package com.mobiletools.systemhelper | grep -E 'codePath|versionName|pkgFlags'
+
+# 作用：解析内置的 SSL Pinning 证书，查看颁发者与加密强度
+keytool -printcert -file assets/pub.cer
+
+# 作用：查看其注册的定时唤醒闹钟（20小时一次及SIM状态监听）
+dumpsys alarm | grep -i systemhelper
+
+# 作用：审计其申请的敏感权限（如READ_PRIVILEGED_PHONE_STATE等）
+dumpsys package com.mobiletools.systemhelper | grep -Ei 'requested permissions|granted=true'
+
+
+# 二、 Smali 代码篡改
+# 作用：在 f0/f.smali 中劫持上报地址，将目标指向本地监听端口
+.field public static w:Ljava/lang/String; = "http://127.0.0.1:9999/registerv3"
+
+# 作用：在 e0/e0.smali 中执行反射获取真实数据后，强行用假数据覆盖寄存器 v9 防崩溃
+invoke-static {v9, v3, v12}, Lf0/o;->c(...)Ljava/lang/Object;
+move-result-object v9
+const-string v9, "FAKE_IMEI_88888888" 
+
+# 作用：在 TestActivity.smali 中注入 Intent，尝试强制拉起系统浏览器发包
+new-instance v0, Landroid/content/Intent;
+const-string v1, "android.intent.action.VIEW"
+invoke-virtual {v0, v1}, Landroid/content/Intent;->setAction(Ljava/lang/String;)Landroid/content/Intent;
+const-string v1, "http://127.0.0.1:9999/test_from_smali"
+invoke-static {v1}, Landroid/net/Uri;->parse(Ljava/lang/String;)Landroid/net/Uri;
+move-result-object v1
+invoke-virtual {v0, v1}, Landroid/content/Intent;->setData(Landroid/net/Uri;)Landroid/content/Intent;
+invoke-virtual {p0, v0}, Landroid/content/Context;->startActivity(Landroid/content/Intent;)V
+return-void
+
+
+# 三、 AndroidManifest.xml 配置修改
+<!-- 作用：删除 sharedUserId 取消特权绑定，修改包名绕过签名冲突 -->
+<!-- 移除原本的 <android:sharedUserId="com.mobiletools.systemhelper.uid" /> -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" 
+          package="com.mobiletools.systemhelper.fake">
+
+
+# 四、 本地抓包监听脚本 (Python)
+# 作用：在本地 9999 端口启动 HTTP 假服务器，接收并保存木马发来的数据
+import http.server, socketserver, datetime
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        data = self.rfile.read(length)
+        header = f"=== 截获时间: {datetime.datetime.now()} ===\n"
+        with open('/sdcard/Download/caught_data.txt', 'ab') as f:
+            f.write(header.encode('utf-8'))
+            f.write(data + b"\n\n")
+        print(f"\n[+] 抓到 {length} 字节数据！")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"code": 200}')
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("", 9999), Handler) as httpd:
+    httpd.serve_forever()
+
+
+# 五、 最终处置方案（免 Root 防御）
+# 作用：从当前用户空间彻底卸载该组件（保留系统文件，不影响OTA）
+pm uninstall -k --user 0 com.mobiletools.systemhelper
+
+# 作用：仅冻结/停用该组件（不想彻底删除时的折中方案）
+pm disable-user --user 0 com.mobiletools.systemhelper
+
+
+l
+代碼部分已經結了
+
+
+
+
+
+运营商特权组件 SystemHelper 深度剖析与绞杀
+
+目标组件：com.mobiletools.systemhelper
+测试环境：OPPO ColorOS (Android 12/13)，无 Root 权限 (仅 Shell UID 2000)
+审计工具：Termux, MT管理器 (Dex编辑器++), Jadx, keytool
+
+一、 目标锁定与身份定性
+
+我们在手机系统底层的特权分区（/my_bigball/priv-app/）发现了一个名为 SystemHelper 的组件。经过初步排查，它并非普通流氓软件，而是固化在系统底层的中国联通 OMA-DM 遥测插件。
+
+对该组件进行解包后，我们提取了其内置的通信证书 assets/pub.cer。令人啼笑皆非的是，作为运营商级别的官方组件，它居然使用了在密码学界早已被淘汰的 1024 位 RSA 弱密钥。这种强度的加密在现代算力面前形同虚设，极易遭到中间人攻击（MITM），且该证书的有效期被极其敷衍地设置到了 100 年后的 2119 年。
+
+此外，在反编译的 Smali 代码中，我们直接抓取到了它硬编码的明文上报接口：http://dm.wo.com.cn:18080。这意味着它的大部分数据交互甚至没有使用 HTTPS 加密。
+
+二、 越界权限与行为审计
+
+通过 dumpsys 深入审计，发现该组件申请了多项令人发指的核心特权（普通应用根本无法获取）：
+
+1. READ_PRIVILEGED_PHONE_STATE：系统级特权，允许它无视 Android 高版本的隐私限制，强行读取双卡 IMEI、IMSI、ICCID。
+2. ACCESS_BACKGROUND_LOCATION：被系统默认授予，即使用户关闭了 APP，它也能在后台静默获取定位轨迹。
+3. PACKAGE_USAGE_STATS：用于监控用户每天使用了哪些 APP、以及具体的使用时长，用于构建用户画像。
+4. QUERY_ALL_PACKAGES：允许它读取手机里安装的所有软件列表。
+
+除了权限，它还设置了极其狡诈的唤醒机制。通过 dumpsys alarm 我们可以看到，它注册了精确闹钟（约 20 小时唤醒一次），同时监听了开机广播（延迟 4 分钟静默启动，防止被系统查杀）和 SIM 卡状态变化广播。只要条件触发，它就会立刻苏醒并打包数据。
+
+三、 源码级反编译分析
+
+将 classes.dex 丢进 Jadx 后，我们看到了一副“流氓全景图”。
+为了绕过 Android 10+ 的隐私限制，它在底层大量使用了 Java 反射机制（setAccessible(true)），强行调用 TelephonyManager 内部的隐藏 API，剥离双卡数据。
+
+更夸张的是，为了实现跨品牌收割，代码中甚至硬编码了一个庞大的 OEM 适配字典（如 y1.java），通过匹配 Build.MODEL（如 PDNM00 对应 OPPO，HLTE226T 对应海信），来针对性地调用不同厂商、不同芯片的底层接口。
+
+四、 动态魔改与逆向对抗
+
+为了抓取它上报的数据，我们进行了堪称外科手术般的 Smali 魔改：
+
+1. 绕过签名冲突：通过修改 AndroidManifest.xml，删除了 sharedUserId，并将包名修改为 .fake，骗过了系统的覆盖安装限制，将其降级为普通应用。
+2. 劫持上报地址：在 f0/f.smali 中，将原本发往联通服务器的地址，强行篡改为了本地监听地址 http://127.0.0.1:9999。
+3. 污染隐私数据：为了防止其失去特权后读取真实 IMEI 报错闪退，我们在 e0/e0.smali 中，在系统返回结果后，强行覆盖寄存器，塞入了假数据 FAKE_IMEI_88888888。
+4. 夺舍 UI 入口：甚至尝试修改 TestActivity，通过注入 Intent，试图直接拉起系统浏览器向本地发请求。
+
+⚠️ 实测血泪教训：
+即便我们完美修改了 Smali 并重签名，该组件在启动时依然会瞬间白屏闪退。通过分析，这是因为该组件存在强烈的 Native 层防篡改校验（SO库）以及全局签名校验。在剥夺其 priv-app 特权并重签名后，进程在底层会直接触发 System.exit() 静默自杀，连 Logcat 的异常日志都不会留下。这完全证实了它是一个依赖特权作恶的寄生虫。
+
+五、 最终处置方案（免 Root 防御）
+
+既然无法在保留其功能的前提下窃取其数据，最安全的做法就是物理切断它的运行。
+
+方案一：剥离与卸载（推荐，安全可逆）
+使用命令 pm uninstall -k --user 0 com.mobiletools.systemhelper。这会将组件从当前用户空间彻底移除，不破坏系统分区，不影响后续的 OTA 更新和正常通讯功能。
+
+方案二：冻结封印
+如果不想彻底卸载，可以使用 pm disable-user --user 0 com.mobiletools.systemhelper 仅停用该应用，保留其数据，随时可恢复。
+
+⚠️ 避坑警告：
+切勿删除 com.qualcomm.qti.services.systemhelper！这是高通芯片的底层系统服务，名字很像，但误删会导致指纹、基带或电源管理异常。清理时请认准前缀 com.mobiletools.。
+
+---
+
+(免责声明：本文仅供移动端安全研究与隐私保护探讨，任何未经授权的非法攻击行为均属违法。)
